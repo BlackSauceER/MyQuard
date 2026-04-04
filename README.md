@@ -1,4 +1,4 @@
-## 
+## 安装
 您需要安装以下包以正常运行此仓库:
 - [Isaac Gym](https://developer.nvidia.com/isaac-gym)
 - Legged Gym
