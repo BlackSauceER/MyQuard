@@ -40,4 +40,5 @@
 使用以下命令测试
 ```bash
     python3 legged_gym/scripts/play.py --task=[robot name]
-```  
+```
+可用的机器人名称：a1、go2
