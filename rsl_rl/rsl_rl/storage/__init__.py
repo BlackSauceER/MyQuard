@@ -5,6 +5,6 @@
 
 """Storage for the learning algorithms."""
 
-from .rollout_storage import RolloutBuffer
+from .rollout_storage import SingleGaitRolloutBuffer, GaitSelectorRolloutBuffer
 
-__all__ = ["RolloutBuffer"]
+__all__ = ["SingleGaitRolloutBuffer", "GaitSelectorRolloutBuffer"]

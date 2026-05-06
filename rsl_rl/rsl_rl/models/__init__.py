@@ -6,7 +6,9 @@
 """Neural models for the learning algorithm."""
 
 from .dreamwaq import DreamWaQ
+from .gait_selector import GaitSelector
 
 __all__ = [
-    "DreamWaQ"
+    "DreamWaQ",
+    "GaitSelector"
 ]

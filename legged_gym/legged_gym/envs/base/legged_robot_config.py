@@ -33,9 +33,11 @@ from .base_config import BaseConfig
 class LeggedRobotCfg(BaseConfig):
     class env:
         num_envs = 4096
-        num_observations = 45
-        num_obs_hist = 5
-        num_privileged_obs = 292 # if not None a priviledge_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise 
+        num_observations = 53
+        num_ce_observations = 30
+        num_selector_observations = 973
+        num_obs_hist = 25    # 历史（不含当前）
+        num_privileged_obs = 300 # if not None a priviledge_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise
         num_actions = 12
         env_spacing = 3.  # not used with heightfields/trimeshes 
         send_timeouts = True # send time out information to the algorithm
@@ -73,9 +75,9 @@ class LeggedRobotCfg(BaseConfig):
         resampling_time = 10. # time before command are changed[s]
         heading_command = False # if true: compute ang vel command from heading error
         class ranges:
-            lin_vel_x = [-1.0, 1.0] # min max [m/s]
-            lin_vel_y = [-1.0, 1.0]   # min max [m/s]
-            ang_vel_yaw = [-1, 1]    # min max [rad/s]
+            lin_vel_x = [0.38, 0.85] # min max [m/s]     Walk: [-0.5, 0.8] ; Trot: [0.3, 1.8] ; Gallop: [0.85, 2.0]
+            lin_vel_y = [-0.3, 0.3]   # min max [m/s]   Walk: [-0.3, 0.3] ; Trot: [-0.5, 0.5] ; Gallop: [-0.3, 0.3]
+            ang_vel_yaw = [-0.6, 0.6]    # min max [rad/s]  Walk: [-1.0, 1.0] ; Trot: [-1.0, 1.0] ; Gallop: [-0.6, 0.6]
             heading = [-3.14, 3.14]
 
     class init_state:
@@ -96,6 +98,7 @@ class LeggedRobotCfg(BaseConfig):
         action_scale = 0.5
         # decimation: Number of control action updates @ sim DT per policy DT
         decimation = 4
+        selector_decimation = 10
 
     class asset:
         file = ""
@@ -137,22 +140,64 @@ class LeggedRobotCfg(BaseConfig):
         randomize_Kd_factor = True
         Kd_factor_range = [0.9, 1.1]
 
+    class phase_gen:
+        gait_name = "trot"
+        random_init_phase = True
+
+        # selector branch
+        selector_gait_order = ["walk", "trot", "gallop"]
+
+        # raw_frequency, raw_swing_ratio, raw_gait_alpha
+        selector_phase_cmd_len = 3
+        selector_phase_cmd_mode = "simple"
+
+        selector_frequency_range = [0.6, 3.2]
+        selector_swing_ratio_range = [0.25, 0.75]
+
     class rewards:
         class scales:
-            termination = -0.0
-            tracking_lin_vel = 1.0
+            # # Single Gait scales for A1
+            # velocity_tracking_gaussian = 1.5
+            # orientation_gaussian = 0.5
+            # base_height_gaussian = 0.5
+            # phase_swing = 1.0
+            # phase_stance = 1.0
+            # energy_cot = 0.2
+            # torque_smooth = 0.2
+            # joint_vel_gaussian = 0.2
+            # collision = -1.0
+
+            # Single Gait scales for Go2
+            # velocity_tracking_gaussian = 1.5
+            # orientation_gaussian = 0.6
+            # base_height_gaussian = 0.5
+            phase_swing = 0.3
+            phase_stance = 0.3
+            # energy_cot = 0.15
+            # torque_smooth = 0.15
+            # joint_vel_gaussian = 0.15
+            # collision = -1.0
+
+            # Gait Selector scales
+            # decision = -0.05
+            # safety = -0.01
+            # cot = -0.05
+
+            # DreamWaQ scales
+            termination = 0.0     # DreamWaQ没有使用，原为0.0
+            tracking_lin_vel = 1.0 # 1.0
             tracking_ang_vel = 0.5
             lin_vel_z = -2.0
             ang_vel_xy = -0.05
             orientation = -0.2
             #torques = -0.00001
             #dof_vel = -0.
-            dof_acc = -2.5e-7
-            base_height = -1.0 
+            dof_acc = -2.5e-7   # -2.5e-7
+            base_height = -1.0
             feet_air_time =  0.1
             # collision = -1.
-            # stumble = -0.01 
-            action_rate = -0.01
+            # stumble = -0.01
+            action_rate = -0.01 # -0.01
             #stand_still = -0.
 
             joint_power=-2e-5
@@ -164,11 +209,27 @@ class LeggedRobotCfg(BaseConfig):
             
 
         only_positive_rewards = True # if true negative total rewards are clipped at zero (avoids early termination problems)
-        tracking_sigma = 0.25 # tracking reward = exp(-error^2/sigma)
+        tracking_sigma = 0.25 # tracking reward = exp(-error^2/sigma) 0.25
+        yaw_tracking_weight = 0.5
+        orientation_beta = 5.0
+        base_height_target = 0.34
+        base_height_beta = 18.0
+        phase_contact_force_norm = 160.0
+        phase_swing_beta = 1.0
+        phase_foot_vel_norm = 3.0
+        phase_stance_beta = 0.25
+        robot_mass = 15.0
+        cot_min_speed = 0.25
+        cot_clip = 20.0
+        energy_beta = 0.008
+        torque_diff_norm = 30.0
+        torque_smooth_beta = 1.0
+        joint_vel_norm = 25.0
+        joint_vel_beta = 1.0
         soft_dof_pos_limit = 1. # percentage of urdf limits, values above this limit are penalized
         soft_dof_vel_limit = 1.
         soft_torque_limit = 1.
-        base_height_target = 1.
+        # base_height_target = 1.
 
 
         max_contact_force = 100. # forces above this value are penalized
@@ -227,15 +288,22 @@ class LeggedRobotCfgPPO(BaseConfig):
     class policy:
         init_weights = True
         init_noise_std = 1.0
-        actor_hidden_dims = [512, 256, 128]
+        actor_hidden_dims = [256, 128]
         critic_hidden_dims = [512, 256, 128]
-        ce_encoder_hidden_dims = [128, 64]
-        ce_decoder_hidden_dims = [64, 128]
+        ce_encoder_hidden_dims = [512, 128]
+        ce_decoder_hidden_dims = [128, 64]
         activation = 'elu' # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
         # only for 'ActorCriticRecurrent':
         # rnn_type = 'lstm'
         # rnn_hidden_size = 512
         # rnn_num_layers = 1
+
+    class selector:
+        hidden_dims = [256, 256, 64]
+        critic_hidden_dims = [512, 256, 128]
+        activation: str = "elu"
+        init_noise_std: float = 0.5
+        init_weights: bool = True
         
     class algorithm:
         # training params
@@ -287,10 +355,10 @@ class LeggedRobotCfgPPO(BaseConfig):
 
 
     class runner:
-        policy_class_name = 'DreamWaQ'
-        algorithm_class_name = 'PPO'
+        # policy_class_name = 'DreamWaQ'
+        # algorithm_class_name = 'PPO'
         num_steps_per_env = 24 # per iteration
-        max_iterations = 3000 # number of policy updates
+        max_iterations = 4500 # number of policy updates
 
         # logging
         save_interval = 200 # check for potential saves every this many iterations

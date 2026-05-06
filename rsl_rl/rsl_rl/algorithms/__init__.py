@@ -5,6 +5,6 @@
 
 """Learning algorithms."""
 
-from .ppo import PPO
+from .ppo import SingleGaitPPO, GaitSelectorPPO
 
-__all__ = ["PPO"]
+__all__ = ["SingleGaitPPO", "GaitSelectorPPO"]

@@ -151,7 +151,9 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
 
 def get_args():
     custom_parameters = [
-        {"name": "--task", "type": str, "default": "anymal_c_flat", "help": "Resume training or start testing from a checkpoint. Overrides config file if provided."},
+        {"name": "--task", "type": str, "default": "go2", "help": "Resume training or start testing from a checkpoint. Overrides config file if provided."},
+        {"name": "--mode", "type": str, "default": "gait", "help": "Environment mode"},
+        {"name": "--policy_name", "type": str, "default": "policy", "help": "Name of the exported policy."},
         {"name": "--resume", "action": "store_true", "default": False,  "help": "Resume training from a checkpoint"},
         {"name": "--experiment_name", "type": str,  "help": "Name of the experiment to run or load. Overrides config file if provided."},
         {"name": "--run_name", "type": str,  "help": "Name of the run. Overrides config file if provided."},
@@ -177,14 +179,17 @@ def get_args():
         args.sim_device += f":{args.sim_device_id}"
     return args
 
-def export_policy_as_jit(actor_critic, path):
-    if hasattr(actor_critic, 'memory_a'):
-        # assumes LSTM: TODO add GRU
-        exporter = PolicyExporterLSTM(actor_critic)
-        exporter.export(path)
+def export_policy_as_jit(actor_critic, path, policy_name):
+    if hasattr(actor_critic, 'ce_encoder'):
+        # export CENet
+        os.makedirs(os.path.join(path, 'vest_models'), exist_ok=True)
+        path = os.path.join(path, 'vest_models', f'{policy_name}.pt')
+        vest = copy.deepcopy(actor_critic.ce_encoder).to('cpu')
+        traced_script_module = torch.jit.script(vest)
+        traced_script_module.save(path)
     else: 
-        os.makedirs(path, exist_ok=True)
-        path = os.path.join(path, 'policy_1.pt')
+        os.makedirs(os.path.join(path, 'policies'), exist_ok=True)
+        path = os.path.join(path, 'policies', f'{policy_name}.pt')
         model = copy.deepcopy(actor_critic.actor).to('cpu')
         traced_script_module = torch.jit.script(model)
         traced_script_module.save(path)

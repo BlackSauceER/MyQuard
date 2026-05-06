@@ -7,10 +7,12 @@
 
 from .actor_critic import CriticNet, ActorNet
 from .ce import CEEncoder, CEDecoder
+from .gait_selector import SelectorActorNet
 
 __all__ = [
     "CriticNet",
     "ActorNet",
     "CEEncoder",
-    "CEDecoder"
+    "CEDecoder",
+    "SelectorActorNet"
 ]

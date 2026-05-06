@@ -38,6 +38,7 @@ from isaacgym.torch_utils import *
 from isaacgym import gymtorch, gymapi, gymutil
 
 import torch
+import torch.nn as nn
 from torch import Tensor
 from typing import Tuple, Dict
 
@@ -46,11 +47,13 @@ from legged_gym.envs.base.base_task import BaseTask
 from legged_gym.utils.terrain import Terrain
 from legged_gym.utils.math import quat_apply_yaw, wrap_to_pi, torch_rand_sqrt_float, get_scale_shift
 from legged_gym.utils.helpers import class_to_dict
+from legged_gym.utils.phase_gen import GaitPhaseGenerator
+from rsl_rl.models import DreamWaQ
 from .legged_robot_config import LeggedRobotCfg
 from collections import deque
 
 class LeggedRobot(BaseTask):
-    def __init__(self, cfg: LeggedRobotCfg, sim_params, physics_engine, sim_device, headless):
+    def __init__(self, cfg: LeggedRobotCfg, mode, sim_params, physics_engine, sim_device, headless):
         """ Parses the provided config file,
             calls create_sim() (which creates, simulation, terrain and environments),
             initilizes pytorch buffers used during training
@@ -64,30 +67,146 @@ class LeggedRobot(BaseTask):
             headless (bool): Run without rendering if True
         """
         self.cfg = cfg
+        self.mode = mode
         self.sim_params = sim_params
         self.height_samples = None
         self.debug_viz = False
         self.init_done = False
         
         self._parse_cfg(self.cfg)
-        super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
+        super().__init__(self.cfg, mode, sim_params, physics_engine, sim_device, headless)
 
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
         self._init_buffers()
+        self._init_phase_generator()
         self._prepare_reward_function()
         self.init_done = True
 
     def step(self, actions):
-        """ Apply actions, simulate, call self.post_physics_step()
+        if self.mode == "gait":
+            return self.step_gait(actions)
+        elif self.mode == "selector":
+            return self.step_selector(actions)
+        else:
+            raise ValueError("Invalid mode! It must be provided as \"gait\" or \"selector\"")
 
-        Args:
-            actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
+    def step_selector(self, actions):
         """
+        Selector mode.
+
+        actions:
+            tuple/list:
+                gait_id:   [num_envs] or [num_envs, 1]
+                phase_cmd: [num_envs, phase_cmd_len]
+
+            or Tensor:
+                [num_envs, 1 + phase_cmd_len]
+                actions[:, 0]  -> gait_id
+                actions[:, 1:] -> phase_cmd
+
+        The selector runs at lower frequency.
+        During one selector step, frozen single-gait policy runs
+        cfg.control.selector_decimation low-level control steps.
+        """
+
+        if not hasattr(self, "single_gait_policies"):
+            raise RuntimeError(
+                "Selector mode requires pretrained single-gait policies. "
+                "Call env.init_single_gait_policy(experiment_name) first."
+            )
+
+        # ---------- 1. parse selector action ----------
+        if isinstance(actions, (tuple, list)):
+            gait_id, phase_cmd = actions
+        else:
+            gait_id = actions[:, 0]
+            phase_cmd = actions[:, 1:]
+
+        gait_id = gait_id.to(self.device)
+        if gait_id.dim() == 2:
+            gait_id = gait_id.squeeze(-1)
+        gait_id = gait_id.long()
+
+        phase_cmd = phase_cmd.to(self.device).float()
+
+        gait_num = len(self.single_gait_policies)
+        gait_id = torch.clamp(gait_id, 0, gait_num - 1)
+
+        self.selector_gait_id[:] = gait_id
+        self.selector_phase_cmd = phase_cmd
+
+        # selector 的 phase 参数只在高层动作更新时设置一次
+        self._set_selector_phase_from_cmd(phase_cmd)
+
+        selector_rew_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        selector_reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        clip_actions = self.cfg.normalization.clip_actions
+
+        self.render()
+
+        # ---------- 2. low-level rollout ----------
+        for _ in range(self.cfg.control.selector_decimation):
+
+            # 与 step_gait() 保持一致：先把上一时刻 ce_obs 推入历史
+            self.disturbance_force = self.disturbance_force.to(self.device)
+
+            self.obs_hist_buf = self.obs_hist_buf[:, self.cfg.env.num_ce_observations:]
+            ce_obs = self.obs_buf[:, -self.cfg.env.num_ce_observations:]
+            assert ce_obs.shape[1] == self.cfg.env.num_ce_observations
+
+            self.obs_hist_buf = torch.cat((self.obs_hist_buf, ce_obs), dim=-1)
+            assert self.obs_hist_buf.shape[1] == self.cfg.env.num_ce_observations * self.cfg.env.num_obs_hist
+
+            self.prev_foot_velocities = self.foot_velocities
+
+            # frozen single-gait policy 产生真实 12 维关节动作
+            low_level_actions = self.compute_gait_actions()
+            self.actions = torch.clip(low_level_actions, -clip_actions, clip_actions).to(self.device)
+
+            # 与 step_gait() 保持一致的物理仿真
+            for _ in range(self.cfg.control.decimation):
+                self.torques = self._compute_torques(self.actions).view(self.torques.shape)
+                self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
+                self.gym.simulate(self.sim)
+
+                if self.device == "cpu":
+                    self.gym.fetch_results(self.sim, True)
+
+                self.gym.refresh_dof_state_tensor(self.sim)
+
+            self.post_physics_step()
+
+            selector_rew_buf += self.rew_buf
+            selector_reset_buf |= self.reset_buf.bool()
+
+        # 高层 selector 一步对应多个低层步，这里取平均，避免 reward 尺度随 selector_decimation 放大
+        self.rew_buf = selector_rew_buf / float(self.cfg.control.selector_decimation)
+        self.reset_buf = selector_reset_buf
+
+        self.last_selector_phase_cmd[:] = self.selector_phase_cmd[:]
+        self.last_selector_gait_id[:] = self.selector_gait_id[:]
+
+        clip_obs = self.cfg.normalization.clip_observations
+        self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
+
+        if self.privileged_obs_buf is not None:
+            self.privileged_obs_buf = torch.clip(self.privileged_obs_buf, -clip_obs, clip_obs)
+
+        self.compute_selector_observations()
+        self.selector_obs_buf = torch.clip(self.selector_obs_buf, -clip_obs, clip_obs)
+
+        return self.selector_obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras
+
+    def step_gait(self, actions):
         #self.obs_hist_buf.append(self.obs_buf) # append the latest obs into hist 
         self.disturbance_force = self.disturbance_force.to(self.device)
-        self.obs_hist_buf = self.obs_hist_buf[:,45:]
-        self.obs_hist_buf = torch.cat((self.obs_hist_buf,self.obs_buf),dim = -1)
+        self.obs_hist_buf = self.obs_hist_buf[:, self.cfg.env.num_ce_observations:]
+        ce_obs = self.obs_buf[:, -self.cfg.env.num_ce_observations:]
+        assert ce_obs.shape[1] == self.cfg.env.num_ce_observations
+        self.obs_hist_buf = torch.cat((self.obs_hist_buf, ce_obs),dim = -1)
+        assert self.obs_hist_buf.shape[1] == self.cfg.env.num_ce_observations * self.cfg.env.num_obs_hist
         # print("###########obs_hist_buf=====",self.obs_hist_buf)
         # self.prev_privileged_obs_buf = self.privileged_obs_buf
         self.prev_foot_velocities = self.foot_velocities
@@ -115,7 +234,7 @@ class LeggedRobot(BaseTask):
 
         if self.privileged_obs_buf is not None:
             self.privileged_obs_buf = torch.clip(self.privileged_obs_buf, -clip_obs, clip_obs)
-        return self.obs_buf, self.privileged_obs_buf, self.obs_hist_buf, self.rew_buf, self.reset_buf, self.extras ## do we need to return obs history buffer??
+        return self.obs_buf, self.privileged_obs_buf, self.obs_hist_buf, self.rew_buf, self.reset_buf, self.extras
 
     def post_physics_step(self):
         """ check terminations, compute observations and rewards
@@ -144,6 +263,10 @@ class LeggedRobot(BaseTask):
         self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
+
+        self.phase_gen.step()
+        self.phase_signal, self.swing_mask, self.phase_phi = self.phase_gen.get_phase()
+
         self.compute_observations() # in some cases a simulation step might be required to refresh some obs (for example body positions)
 
         self.slast_actions[:] = self.last_actions[:]
@@ -159,6 +282,8 @@ class LeggedRobot(BaseTask):
 
         if self.viewer and self.enable_viewer_sync and self.debug_viz:
             self._draw_debug_vis()
+
+        self.last_torques[:] = self.torques[:]
 
     def check_termination(self):
         """ Check if environments need to be reset
@@ -197,9 +322,38 @@ class LeggedRobot(BaseTask):
         self.slast_actions[env_ids] = 0.
         self.last_actions[env_ids] = 0.
         self.last_dof_vel[env_ids] = 0.
+        self.last_root_vel[env_ids] = 0.
         self.feet_air_time[env_ids] = 0.
+        self.last_contacts[env_ids] = False
+
         self.episode_length_buf[env_ids] = 0
         self.reset_buf[env_ids] = 1
+
+        # 清空 CENet 历史，避免跨 episode 泄漏
+        self.obs_hist_buf[env_ids] = 0.
+
+        # 可选但推荐：清空当前 obs，随后 post_physics_step() 会重新 compute_observations()
+        self.obs_buf[env_ids] = 0.
+        if self.privileged_obs_buf is not None:
+            self.privileged_obs_buf[env_ids] = 0.
+
+        # selector obs 如果你已经启用了 selector_obs_buf，也应该重置
+        self.selector_obs_buf[env_ids] = 0.
+
+        # 清空动作相关历史，避免 smoothness/action_rate 在 reset 后跨 episode 惩罚
+        self.joint_pos_target[env_ids] = self.default_dof_pos
+        self.last_joint_pos_target[env_ids] = self.default_dof_pos
+        self.last_last_joint_pos_target[env_ids] = self.default_dof_pos
+        self.last_torques[env_ids] = 0.
+
+        if hasattr(self, "selector_phase_cmd"):
+            self.selector_phase_cmd[env_ids] = 0.
+            self.last_selector_phase_cmd[env_ids] = 0.
+        if hasattr(self, "selector_gait_id"):
+            self.selector_gait_id[env_ids] = 0
+            self.last_selector_gait_id[env_ids] = 0
+        # reset phase gen 重置相位生成器
+        self.phase_gen.reset(env_ids, random_init_phase=self.cfg.phase_gen.random_init_phase)
         # fill extras
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
@@ -213,6 +367,40 @@ class LeggedRobot(BaseTask):
         # send timeout info to the algorithm
         if self.cfg.env.send_timeouts:
             self.extras["time_outs"] = self.time_out_buf
+
+    def init_single_gait_policy(self, experiment_name):
+        # init pretrained single gait policy, only for "selector" mode.
+        exported_path = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", experiment_name, "exported")
+
+        path_vest = os.path.join(exported_path, "vest_models")
+        self.vest_model = torch.jit.load(os.path.join(path_vest, "trot.pt"), map_location=self.device).eval()
+
+        for param in self.vest_model.parameters():
+            param.requires_grad_(False)
+
+        path_policies = os.path.join(exported_path, "policies")
+
+        gait_order = self.cfg.phase_gen.selector_gait_order
+
+        policies = []
+        loaded_policy_files = []
+        for gait_name in gait_order:
+            policy_path = os.path.join(path_policies, f"{gait_name}.pt")
+            if not os.path.exists(policy_path):
+                raise FileNotFoundError(
+                    f"Missing policy file: {policy_path}. "
+                    f"Expected policies according to selector_gait_order={gait_order}"
+                )
+
+            policy = torch.jit.load(policy_path, map_location=self.device).eval()
+            for param in policy.parameters():
+                param.requires_grad_(False)
+
+            policies.append(policy)
+            loaded_policy_files.append(f"{gait_name}.pt")
+
+        self.single_gait_policies = nn.ModuleList(policies)
+        print("Loaded single gait policies in selector order:", loaded_policy_files)
     
     def compute_reward(self):
         """ Compute rewards
@@ -236,24 +424,134 @@ class LeggedRobot(BaseTask):
     def compute_observations(self):
         """ Computes observations
         """
-        self.obs_buf = torch.cat((  self.base_ang_vel  * self.obs_scales.ang_vel,
-                                    self.projected_gravity,
-                                    self.commands[:, :3] * self.commands_scale,
-                                    (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-                                    self.dof_vel * self.obs_scales.dof_vel,
-                                    self.actions
-                                    ),dim=-1)
+        self.obs_buf = torch.cat((
+            self.phase_signal,                                                  # 0:8
+            self.commands[:, :3] * self.commands_scale,                         # 8:11
+            self.actions,                                                       # 11:23
+            self.base_ang_vel  * self.obs_scales.ang_vel,                       # 23:26
+            self.projected_gravity,                                             # 26:29
+            (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,    # 29:41
+            self.dof_vel * self.obs_scales.dof_vel                              # 41:53
+            ),dim=-1)
         # add perceptive inputs if not blind
         
         heights = torch.clip(self.root_states[:, 2].unsqueeze(1) - 0.5 - self.measured_heights, -1, 1.) * self.obs_scales.height_measurements
         
         #self.obs_buf = torch.cat((self.obs_buf, heights), dim=-1)
         contact_forces_scale, contact_forces_shift = get_scale_shift(self.cfg.normalization.contact_force_range)
-        self.privileged_obs_buf = torch.cat((self.obs_buf,self.base_lin_vel*self.obs_scales.lin_vel,(self.contact_forces.view(self.num_envs, -1) - contact_forces_shift) * contact_forces_scale,heights),dim=-1) ## check the velocity and disturbance force part
-        ## privileged_obs_buffer shape = 4096,286
+        self.privileged_obs_buf = torch.cat((
+            self.obs_buf,
+            self.base_lin_vel*self.obs_scales.lin_vel,
+            (self.contact_forces.view(self.num_envs, -1) - contact_forces_shift) * contact_forces_scale,
+            heights
+            ),dim=-1) ## check the velocity and disturbance force part
+
         # add noise if needed
         if self.add_noise:
             self.obs_buf += (2 * torch.rand_like(self.obs_buf) - 1) * self.noise_scale_vec
+
+    def compute_selector_observations(self):
+        heights = torch.clip(self.root_states[:, 2].unsqueeze(1) - 0.5 - self.measured_heights, -1,1.) * self.obs_scales.height_measurements
+        self.selector_obs_buf = torch.cat((
+            self.commands[:, :3] * self.commands_scale,  # 3
+            heights,  # 187
+            self.obs_buf[:, -self.cfg.env.num_ce_observations:],  # 30
+            self.obs_hist_buf.view(self.num_envs, -1),  # 750
+            self.last_selector_phase_cmd  # 3
+        ), dim=-1)
+
+    def compute_gait_actions(self):
+        """
+        Compute real 12D joint actions from frozen single-gait policies.
+
+        self.selector_gait_id:
+            [num_envs], 0=walk, 1=trot, 2=gallop
+
+        self.selector_phase_cmd:
+            [num_envs, phase_cmd_len]
+
+        Current recommended phase_cmd_len:
+            3 for phase_gen simple mode:
+                raw_frequency
+                raw_swing_ratio
+                raw_gait_alpha
+        """
+
+        if not hasattr(self, "selector_gait_id"):
+            raise RuntimeError("compute_gait_actions() called before selector_gait_id is set.")
+
+        if not hasattr(self, "vest_model"):
+            raise RuntimeError("compute_gait_actions() requires self.vest_model.")
+
+        # phase_gen 的 phase_signal 已经由 _set_selector_phase_from_cmd() 和 post_physics_step() 维护。
+        # 这里重新计算当前低层 policy obs，使 obs 中的 phase_signal 是最新的。
+        self.phase_signal, self.swing_mask, self.phase_phi = self.phase_gen.get_phase()
+        self.compute_observations()
+
+        obs = self.obs_buf
+        history = self.obs_hist_buf
+        gait_id = self.selector_gait_id
+
+        with torch.no_grad():
+            vel, latent_mean, latent_logvar, latent = self.vest_model(history)
+            code = torch.cat((vel, latent), dim=-1)
+
+        low_level_actions = torch.zeros(
+            self.num_envs,
+            self.num_actions,
+            dtype=torch.float,
+            device=self.device,
+            requires_grad=False,
+        )
+
+        with torch.no_grad():
+            for gait_idx, policy in enumerate(self.single_gait_policies):
+                env_ids = (gait_id == gait_idx).nonzero(as_tuple=False).flatten()
+                if len(env_ids) == 0:
+                    continue
+
+                obs_i = obs[env_ids]
+                code_i = code[env_ids]
+
+                # ActorNet 导出版本通常只接受 policy_input。
+                policy_input_i = torch.cat((obs_i, code_i.detach()), dim=-1)
+                act_i = policy(policy_input_i)
+                low_level_actions[env_ids] = act_i
+
+        return low_level_actions
+
+    def _set_selector_phase_from_cmd(self, phase_cmd):
+        """
+        Apply selector continuous action to GaitPhaseGenerator.
+
+        phase_gen.py already supports:
+            mode="simple": phase_cmd dim = 3
+                raw_frequency
+                raw_swing_ratio
+                raw_gait_alpha
+
+            mode="template_softmax": phase_cmd dim = 5
+                raw_frequency
+                raw_swing_ratio
+                logits_walk
+                logits_trot
+                logits_gallop
+        """
+
+        mode = self.cfg.phase_gen.selector_phase_cmd_mode
+        frequency_range = self.cfg.phase_gen.selector_frequency_range
+        swing_ratio_range = self.cfg.phase_gen.selector_swing_ratio_range
+
+        self.phase_gen.set_params_from_cmd(
+            phase_cmd,
+            mode=mode,
+            reset_phase=False,
+            preserve_phase=True,
+            frequency_range=frequency_range,
+            swing_ratio_range=swing_ratio_range,
+        )
+
+        self.phase_signal, self.swing_mask, self.phase_phi = self.phase_gen.get_phase()
 
     def create_sim(self):
         """ Creates simulation, terrain and evironments
@@ -540,14 +838,24 @@ class LeggedRobot(BaseTask):
         self.add_noise = self.cfg.noise.add_noise
         noise_scales = self.cfg.noise.noise_scales
         noise_level = self.cfg.noise.noise_level
-        noise_vec[0:3] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
-        noise_vec[3:6] = noise_scales.gravity * noise_level
-        noise_vec[6:9] = 0.0
-        noise_vec[9:21] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
-        noise_vec[21:33] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
-        noise_vec[33:45] = 0.0
-        # if self.cfg.terrain.measure_heights:
-        #     noise_vec[48:235] = noise_scales.height_measurements* noise_level * self.obs_scales.height_measurements
+
+        # obs layout:
+        # 0:8   phase_signal
+        # 8:11  commands
+        # 11:23 actions
+        # 23:26 base_ang_vel
+        # 26:29 projected_gravity
+        # 29:41 dof_pos
+        # 41:53 dof_vel
+
+        noise_vec[0:8] = 0.0
+        noise_vec[8:11] = 0.0
+        noise_vec[11:23] = 0.0
+        noise_vec[23:26] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
+        noise_vec[26:29] = noise_scales.gravity * noise_level
+        noise_vec[29:41] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
+        noise_vec[41:53] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
+
         return noise_vec
 
     #----------------------------------------
@@ -610,6 +918,13 @@ class LeggedRobot(BaseTask):
         if self.cfg.terrain.measure_heights:
             self.height_points = self._init_height_points()
         self.measured_heights = 0
+        self.last_torques = torch.zeros_like(self.torques)
+
+        self.selector_gait_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device, requires_grad=False)
+        self.last_selector_gait_id = torch.zeros_like(self.selector_gait_id)
+        self.selector_phase_cmd = torch.zeros(self.num_envs, self.cfg.phase_gen.selector_phase_cmd_len, dtype=torch.float, device=self.device, requires_grad=False)
+
+        self.last_selector_phase_cmd = torch.zeros_like(self.selector_phase_cmd)
 
         # joint positions offsets and PD gains
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
@@ -641,6 +956,17 @@ class LeggedRobot(BaseTask):
         self.Kp_factors = torch.ones(self.num_envs, self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
         self.Kd_factors = torch.ones(self.num_envs, self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
 
+    def _init_phase_generator(self):
+        # init phase gen in env seems to be better
+        self.phase_gen = GaitPhaseGenerator(
+            self.num_envs,
+            self.device,
+            self.cfg.sim.dt * self.cfg.control.decimation,
+            self.cfg.phase_gen.gait_name,
+            self.cfg.phase_gen.random_init_phase
+        )
+
+        self.phase_signal, self.swing_mask, self.phase_phi = self.phase_gen.get_phase()
 
     def _prepare_reward_function(self):
         """ Prepares a list of reward functions, whcih will be called to compute the total reward.
@@ -918,7 +1244,105 @@ class LeggedRobot(BaseTask):
 
         return heights.view(self.num_envs, -1) * self.terrain.cfg.vertical_scale
 
-    #------------ reward functions----------------
+    #------------Single Gait reward functions-------------
+    def _reward_velocity_tracking_gaussian(self):
+        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
+        yaw_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+        # 可调权重，防止 yaw 项过强或过弱
+        error = lin_vel_error + self.cfg.rewards.yaw_tracking_weight * yaw_vel_error
+        return torch.exp(-error / self.cfg.rewards.tracking_sigma)
+
+    def _reward_orientation_gaussian(self):
+        # projected_gravity 理想情况下 x,y 接近 0
+        x = torch.norm(self.projected_gravity[:, :2], dim=1)
+        return torch.exp(-self.cfg.rewards.orientation_beta * torch.square(x))
+
+    def _reward_base_height_gaussian(self):
+        if self.cfg.terrain.measure_heights:
+            base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
+        else:
+            base_height = self.root_states[:, 2]
+
+        height_error = base_height - self.cfg.rewards.base_height_target
+        return torch.exp(-self.cfg.rewards.base_height_beta * torch.square(height_error))
+
+    def _reward_phase_swing(self):
+        """
+        Expected swing feet should have small contact force.
+
+        self.swing_mask: [num_envs, 4]
+            1.0 means expected swing
+            0.0 means expected stance
+
+        contact_forces[:, feet_indices, :]: [num_envs, 4, 3]
+        """
+        foot_forces = torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1)  # [num_envs, 4]
+        x = torch.sum(self.swing_mask * foot_forces, dim=1)
+        # normalize contact force to make beta easier to tune
+        x = x / self.cfg.rewards.phase_contact_force_norm
+        return torch.exp(-self.cfg.rewards.phase_swing_beta * torch.square(x))
+
+    def _reward_phase_stance(self):
+        """
+        Expected stance feet should have small world-frame foot velocity.
+        """
+        foot_vel = torch.norm(self.foot_velocities, dim=-1)  # [num_envs, 4]
+        stance_mask = 1.0 - self.swing_mask
+        x = torch.sum(stance_mask * foot_vel, dim=1)
+        # normalize foot velocity
+        x = x / self.cfg.rewards.phase_foot_vel_norm
+        return torch.exp(-self.cfg.rewards.phase_stance_beta * torch.square(x))
+
+    def _reward_energy_cot(self):
+        power = torch.sum(torch.abs(self.dof_vel * self.torques), dim=1)
+        speed = torch.norm(self.base_lin_vel[:, :2], dim=1)
+        speed = torch.clamp(speed, min=self.cfg.rewards.cot_min_speed)
+        mg = self.cfg.rewards.robot_mass * 9.81
+        cot = power / (mg * speed)
+        cot = torch.clamp(cot, max=self.cfg.rewards.cot_clip)
+        return torch.exp(-self.cfg.rewards.energy_beta * torch.square(cot))
+
+    def _reward_torque_smooth(self):
+        torque_diff = torch.norm(self.torques - self.last_torques, dim=1)
+        x = torque_diff / self.cfg.rewards.torque_diff_norm
+        return torch.exp(-self.cfg.rewards.torque_smooth_beta * torch.square(x))
+
+    def _reward_joint_vel_gaussian(self):
+        joint_vel_norm = torch.norm(self.dof_vel, dim=1)
+        x = joint_vel_norm / self.cfg.rewards.joint_vel_norm
+        return torch.exp(-self.cfg.rewards.joint_vel_beta * torch.square(x))
+
+    # ------------Gait Selector reward functions----------------
+    def _reward_decision(self):
+        if not hasattr(self, "selector_phase_cmd") or not hasattr(self, "last_selector_phase_cmd"):
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        return torch.norm(
+            self.selector_phase_cmd - self.last_selector_phase_cmd,
+            p=2,
+            dim=1
+        )
+
+    def _reward_safety(self):
+        return torch.max(torch.abs(self.dof_vel), dim=1)[0]
+
+    def _reward_cot(self):
+        power = torch.abs(torch.sum(self.dof_vel * self.torques, dim=1))
+
+        speed = torch.norm(self.base_lin_vel[:, :2], dim=1)
+        speed = torch.clamp(speed, min=self.cfg.rewards.cot_min_speed)
+
+        mass = self.cfg.rewards.robot_mass
+        gravity = 9.81
+
+        cot = power / (mass * gravity * speed)
+
+        # 防止极端状态下 CoT 爆炸
+        cot = torch.clamp(cot, max=self.cfg.rewards.cot_clip)
+
+        return cot
+
+    #------------DreamWaQ reward functions----------------
     def _reward_lin_vel_z(self):
         # Penalize z axis base linear velocity
         return torch.square(self.base_lin_vel[:, 2])

@@ -36,8 +36,8 @@ import statistics
 from torch.utils.tensorboard import SummaryWriter
 import torch
 
-from rsl_rl.algorithms import PPO
-from rsl_rl.models import DreamWaQ
+from rsl_rl.algorithms import SingleGaitPPO, GaitSelectorPPO
+from rsl_rl.models import DreamWaQ, GaitSelector
 from rsl_rl.env import VecEnv
 
 
@@ -45,6 +45,7 @@ class OnPolicyRunner:
 
     def __init__(self,
                  env: VecEnv,
+                 mode: str,
                  train_cfg,
                  log_dir=None,
                  device='cpu'):
@@ -52,36 +53,70 @@ class OnPolicyRunner:
         self.cfg=train_cfg["runner"]
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
+        self.selector_cfg = train_cfg["selector"]
         self.device = device
         self.env = env
+        self.mode = mode
 
-        # 初始化模型与PPO
-        policy_class = eval(self.cfg["policy_class_name"]) # DreamWaQ
-        policy: DreamWaQ = policy_class( 
-            obs_dim = self.env.num_observations,
-            state_dim = self.env.num_privileged_obs,
-            action_dim = self.env.num_actions,
-            history_len = self.env.num_obs_hist,
-            latent_dim = 16,
-            **self.policy_cfg
-        ).to(self.device)
-        
-        alg_class = eval(self.cfg["algorithm_class_name"]) # PPO
-        self.alg: PPO = alg_class(
-            policy, 
-            device=self.device, 
-            **self.alg_cfg
-        )
-        
-        self.num_steps_per_env = self.cfg["num_steps_per_env"]
-        self.alg.init_storage(
-            self.env.num_envs, 
-            self.num_steps_per_env, 
-            [self.env.num_observations], 
-            [self.env.num_privileged_obs], 
-            [self.env.num_obs_hist * self.env.num_observations], 
-            [self.env.num_actions]
-        )
+        # 初始化策略模型和PPO
+        if self.mode == "gait":
+            policy = DreamWaQ(
+                obs_dim = self.env.num_observations,
+                ce_obs_dim = self.env.num_ce_observations,
+                state_dim = self.env.num_privileged_obs,
+                action_dim = self.env.num_actions,
+                history_len = self.env.num_obs_hist,
+                latent_dim = 16,
+                **self.policy_cfg
+            ).to(self.device)
+
+            self.alg = SingleGaitPPO(
+                policy,
+                device=self.device,
+                **self.alg_cfg
+            )
+
+            self.num_steps_per_env = self.cfg["num_steps_per_env"]
+            self.alg.init_storage(
+                self.env.num_envs,
+                self.num_steps_per_env,
+                [self.env.num_observations],
+                [self.env.num_ce_observations],
+                [self.env.num_privileged_obs],
+                [self.env.num_obs_hist * self.env.num_ce_observations],
+                [self.env.num_actions]
+            )
+
+        elif self.mode == "selector":
+            # TODO
+            env.init_single_gait_policy(self.cfg["experiment_name"])
+
+            policy = GaitSelector(
+                obs_dim=env.num_selector_observations,
+                state_dim=env.num_privileged_obs,
+                gait_num=3,
+                phase_cmd_len=3,
+                **self.selector_cfg
+            )
+
+            self.alg = GaitSelectorPPO(
+                policy,
+                device=self.device,
+                **self.alg_cfg
+            )
+
+            self.num_steps_per_env = self.cfg["num_steps_per_env"]
+            self.alg.init_storage(
+                self.env.num_envs,
+                self.num_steps_per_env,
+                [self.env.num_selector_observations],
+                [self.env.num_privileged_obs],
+                [3],
+                3,
+            )
+
+        else:
+            raise ValueError("Invalid mode! It must be provided as \"gait\" or \"selector\"")
 
         # Log
         self.save_interval = self.cfg["save_interval"]
@@ -91,9 +126,107 @@ class OnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
 
-        _, _, _, _ = self.env.reset()
-    
+        self.env.reset()
+
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        if self.mode == "gait":
+            self.learn_gait(num_learning_iterations, init_at_random_ep_len)
+        elif self.mode == "selector":
+            self.learn_selector(num_learning_iterations, init_at_random_ep_len)
+        else:
+            raise ValueError("Invalid mode! It must be provided as \"gait\" or \"selector\"")
+
+    def learn_selector(self, num_learning_iterations, init_at_random_ep_len=False):
+        if self.log_dir is not None and self.writer is None:
+            self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+
+        if init_at_random_ep_len:
+            self.env.episode_length_buf = torch.randint_like(
+                self.env.episode_length_buf,
+                high=int(self.env.max_episode_length)
+            )
+
+        # 初始化 selector obs
+        self.env.compute_observations()
+        self.env.compute_selector_observations()
+
+        obs = self.env.selector_obs_buf
+        privileged_obs = self.env.get_privileged_observations()
+        critic_obs = privileged_obs if privileged_obs is not None else obs
+
+        obs = obs.to(self.device)
+        critic_obs = critic_obs.to(self.device)
+
+        self.alg.switch_to_train()
+
+        ep_infos = []
+        rewbuffer = deque(maxlen=100)
+        lenbuffer = deque(maxlen=100)
+
+        cur_reward_sum = torch.zeros(
+            self.env.num_envs,
+            dtype=torch.float,
+            device=self.device
+        )
+        cur_episode_length = torch.zeros(
+            self.env.num_envs,
+            dtype=torch.float,
+            device=self.device
+        )
+
+        tot_iter = self.current_learning_iteration + num_learning_iterations
+
+        for it in range(self.current_learning_iteration, tot_iter):
+            start = time.time()
+
+            with torch.inference_mode():
+                for i in range(self.num_steps_per_env):
+                    actions = self.alg.record_before_act(obs, critic_obs)
+                    obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
+                    critic_obs = privileged_obs if privileged_obs is not None else obs
+                    obs = obs.to(self.device)
+                    critic_obs = critic_obs.to(self.device)
+                    rewards = rewards.to(self.device)
+                    dones = dones.to(self.device)
+                    self.alg.record_after_act(rewards, dones, infos)
+
+                    if self.log_dir is not None:
+                        if "episode" in infos:
+                            ep_infos.append(infos["episode"])
+                        cur_reward_sum += rewards
+                        cur_episode_length += 1
+                        new_ids = (dones > 0).nonzero(as_tuple=False).flatten()
+                        if len(new_ids) > 0:
+                            rewbuffer.extend(cur_reward_sum[new_ids].cpu().numpy().tolist())
+                            lenbuffer.extend(cur_episode_length[new_ids].cpu().numpy().tolist())
+
+                            cur_reward_sum[new_ids] = 0
+                            cur_episode_length[new_ids] = 0
+
+                stop = time.time()
+                collection_time = stop - start
+                start = stop
+                self.alg.compute_returns(critic_obs)
+
+            mean_value_loss, mean_surrogate_loss, mean_entropy_loss, \
+                mean_recons_loss, mean_vel_loss, mean_kld_loss = self.alg.update()
+
+            stop = time.time()
+            learn_time = stop - start
+
+            if self.log_dir is not None:
+                self.log(locals())
+
+            if it % self.save_interval == 0:
+                self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+
+            ep_infos.clear()
+
+        self.current_learning_iteration += num_learning_iterations
+
+        self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+
+    def learn_gait(self, num_learning_iterations, init_at_random_ep_len=False):
         # initialize writer
         if self.log_dir is not None and self.writer is None:
             self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
@@ -128,7 +261,8 @@ class OnPolicyRunner:
                     obs.to(self.device), critic_obs.to(self.device), obs_hist.to(self.device), rewards.to(self.device), dones.to(self.device)
                     # print("######prev_critic_obs =====",prev_critic_obs[0,0],'\n',"#####critic_obs =====",critic_obs[0,0])
                     # print("######obs_hist =====",obs_hist[180,0],'\n',"#####obs =====",obs[0,0])
-                    self.alg.record_after_act(rewards, dones, obs, infos)
+                    ce_obs = obs[:, -self.env.num_ce_observations:]
+                    self.alg.record_after_act(rewards, dones, ce_obs, infos)    # 这里记录的应该是ce_obs
                     
                     if self.log_dir is not None:
                         # Book keeping
@@ -243,22 +377,28 @@ class OnPolicyRunner:
         print(log_string)
 
     def save(self, path, infos=None):
-        torch.save({
-            'model_state_dict': self.alg.model.state_dict(),
-            'optimizer_state_dict_policy': self.alg.optimizer_policy.state_dict(),
-            'optimizer_state_dict_cenet': self.alg.optimizer_cenet.state_dict(),
-            'iter': self.current_learning_iteration,
-            'infos': infos,
-        }, path)
+        save_dict = {
+            "model_state_dict": self.alg.model.state_dict(),
+            "optimizer_state_dict_policy": self.alg.optimizer_policy.state_dict(),
+            "iter": self.current_learning_iteration,
+            "infos": infos,
+        }
+
+        if hasattr(self.alg, "optimizer_cenet"):
+            save_dict["optimizer_state_dict_cenet"] = self.alg.optimizer_cenet.state_dict()
+
+        torch.save(save_dict, path)
 
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path)
-        self.alg.model.load_state_dict(loaded_dict['model_state_dict'])
+        self.alg.model.load_state_dict(loaded_dict["model_state_dict"])
         if load_optimizer:
-            self.alg.optimizer_policy.load_state_dict(loaded_dict['optimizer_state_dict_policy'])
-            self.alg.optimizer_cenet.load_state_dict(loaded_dict['optimizer_state_dict_cenet'])
-        self.current_learning_iteration = loaded_dict['iter']
-        return loaded_dict['infos']
+            self.alg.optimizer_policy.load_state_dict(loaded_dict["optimizer_state_dict_policy"])
+            if hasattr(self.alg, "optimizer_cenet") and "optimizer_state_dict_cenet" in loaded_dict:
+                self.alg.optimizer_cenet.load_state_dict(loaded_dict["optimizer_state_dict_cenet"])
+
+        self.current_learning_iteration = loaded_dict["iter"]
+        return loaded_dict["infos"]
 
     def get_inference_policy(self, device=None):
         self.alg.model.eval() # switch to evaluation mode (dropout for example)

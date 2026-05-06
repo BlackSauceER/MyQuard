@@ -14,6 +14,9 @@ from typing import Tuple, Union
 class VecEnv(ABC):
     num_envs: int
     num_observations: int
+    num_ce_observations: int
+    num_selector_observations: int
+    privileged_obs_buf: torch.Tensor
     num_privileged_obs: int
     num_actions: int
     num_cenet_lantent: int
@@ -27,14 +30,17 @@ class VecEnv(ABC):
     # cfg: dict | object
 
     @abstractmethod
-    def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, Union[torch.Tensor, None], torch.Tensor, torch.Tensor, dict]:
+    def step(self, actions: torch.Tensor):
         pass
     @abstractmethod
-    def reset(self, env_ids: Union[list, torch.Tensor]):
+    def reset(self):
         pass
     @abstractmethod
     def get_observations(self) -> torch.Tensor:
         pass
     @abstractmethod
     def get_privileged_observations(self) -> Union[torch.Tensor, None]:
+        pass
+    @abstractmethod
+    def init_single_gait_policy(self, experiment_name):
         pass

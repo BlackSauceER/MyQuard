@@ -11,6 +11,7 @@ from rsl_rl.utils.torch_utils import MultivariateGaussianDiagonalCovariance
 class DreamWaQ(nn.Module):
     def __init__(self,
                  obs_dim: int,
+                 ce_obs_dim: int,
                  state_dim: int,
                  action_dim: int,
                  history_len: int,
@@ -44,7 +45,7 @@ class DreamWaQ(nn.Module):
         # CENet
         # encoder输入时序感知，输出v和z
         self.ce_encoder = CEEncoder(
-            input_dim =obs_dim * history_len,
+            input_dim = ce_obs_dim * history_len,
             output_dim = latent_dim + 3,    # z和v
             hidden_dims = ce_encoder_hidden_dims,
             activation_name = activation,
@@ -53,7 +54,7 @@ class DreamWaQ(nn.Module):
         # decoder输入v和z，预测下一时间步观测。
         self.ce_decoder = CEDecoder(
             input_dim = latent_dim + 3,     # z和v
-            output_dim = obs_dim,
+            output_dim = ce_obs_dim,
             hidden_dims = ce_decoder_hidden_dims,
             activation_name = activation,
             init_weights = init_weights

@@ -3,10 +3,11 @@ import time
 import mujoco.viewer
 import mujoco
 import numpy as np
-from legged_gym import LEGGED_GYM_ROOT_DIR
 import torch
 import yaml
-from rsl_rl.models import DreamWaQ
+
+from legged_gym import LEGGED_GYM_ROOT_DIR
+from rsl_rl.modules import CEEncoder
 
 
 def get_gravity_orientation(quaternion):
@@ -37,7 +38,7 @@ if __name__ == "__main__":
     parser.add_argument("config_file", type=str, help="config file name in the config folder")
     args = parser.parse_args()
     config_file = args.config_file
-    with open(f"{LEGGED_GYM_ROOT_DIR}/deploy/deploy_mujoco/configs/{config_file}", "r") as f:
+    with open(f"/home/blauce/PycharmProjects/MyQuardSim2Sim/deploy_mujoco/configs/{config_file}.yaml", "r") as f:  # TODO: 把绝对路径改成自动识别
         config = yaml.load(f, Loader=yaml.FullLoader)
         policy_path = config["policy_path"].replace("{LEGGED_GYM_ROOT_DIR}", LEGGED_GYM_ROOT_DIR)
         xml_path = config["xml_path"].replace("{LEGGED_GYM_ROOT_DIR}", LEGGED_GYM_ROOT_DIR)
@@ -59,13 +60,15 @@ if __name__ == "__main__":
 
         num_actions = config["num_actions"]
         num_obs = config["num_obs"]
-        
+        num_obs_hist = 5
+
         cmd = np.array(config["cmd_init"], dtype=np.float32)
 
     # define context variables
     action = np.zeros(num_actions, dtype=np.float32)
     target_dof_pos = default_angles.copy()
     obs = np.zeros(num_obs, dtype=np.float32)
+    obs_hist = torch.zeros(1, num_obs_hist * num_obs, dtype=torch.float)
 
     counter = 0
 
@@ -73,18 +76,13 @@ if __name__ == "__main__":
     m = mujoco.MjModel.from_xml_path(xml_path)
     d = mujoco.MjData(m)
     m.opt.timestep = simulation_dt
-
+    # 加载CEEncoder
+    encoder = CEEncoder(
+            input_dim = num_obs * num_obs_hist,
+            output_dim = 19    # z和v
+        )
     # load policy
     policy = torch.jit.load(policy_path)
-    # # 初始化模型与PPO
-    # policy: DreamWaQ = DreamWaQ( 
-    #         obs_dim = 45,
-    #         state_dim = 286,
-    #         action_dim = 12,
-    #         history_len = 5,
-    #         latent_dim = 16,
-    #         **self.policy_cfg
-    #     ).to(self.device)
 
     with mujoco.viewer.launch_passive(m, d) as viewer:
         # Close the viewer automatically after simulation_duration wall-seconds.
@@ -118,16 +116,23 @@ if __name__ == "__main__":
                 sin_phase = np.sin(2 * np.pi * phase)
                 cos_phase = np.cos(2 * np.pi * phase)
 
+                # obs和obs历史
                 obs[:3] = omega
                 obs[3:6] = gravity_orientation
                 obs[6:9] = cmd * cmd_scale
-                obs[9 : 9 + num_actions] = qj
-                obs[9 + num_actions : 9 + 2 * num_actions] = dqj
-                obs[9 + 2 * num_actions : 9 + 3 * num_actions] = action
+                obs[9: 9 + num_actions] = qj
+                obs[9 + num_actions: 9 + 2 * num_actions] = dqj
+                obs[9 + 2 * num_actions: 9 + 3 * num_actions] = action
                 # obs[9 + 3 * num_actions : 9 + 3 * num_actions + 2] = np.array([sin_phase, cos_phase])
                 obs_tensor = torch.from_numpy(obs).unsqueeze(0)
+                obs_hist = obs_hist[:, 45:]
+                obs_hist = torch.cat((obs_hist, obs_tensor), dim=-1)
+                # 组装策略输入
+                vel, _, _, latent = encoder(obs_hist)
+                code = torch.cat((vel, latent), dim=-1)
+                policy_input = torch.cat((obs_tensor, code.detach()), dim=-1)
                 # policy inference
-                action = policy(obs_tensor).detach().numpy().squeeze()
+                action = policy(policy_input).detach().numpy().squeeze()
                 # transform action to target_dof_pos
                 target_dof_pos = action * action_scale + default_angles
 

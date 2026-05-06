@@ -37,9 +37,10 @@ import torch
 # Base class for RL tasks
 class BaseTask():
 
-    def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
+    def __init__(self, cfg, mode, sim_params, physics_engine, sim_device, headless):
         self.gym = gymapi.acquire_gym()
 
+        self.mode = mode
         self.sim_params = sim_params
         self.physics_engine = physics_engine
         self.sim_device = sim_device
@@ -59,6 +60,8 @@ class BaseTask():
 
         self.num_envs = cfg.env.num_envs
         self.num_observations = cfg.env.num_observations
+        self.num_ce_observations = cfg.env.num_ce_observations
+        self.num_selector_observations = cfg.env.num_selector_observations
         self.num_obs_hist = cfg.env.num_obs_hist
         self.num_privileged_obs = cfg.env.num_privileged_obs
         self.num_actions = cfg.env.num_actions
@@ -69,7 +72,8 @@ class BaseTask():
 
         # allocate buffers
         self.obs_buf = torch.zeros(self.num_envs, self.num_observations, device=self.device, dtype=torch.float)
-        self.obs_hist_buf = torch.zeros(self.num_envs, self.num_obs_hist*self.num_observations, device = self.device, dtype=torch.float)
+        self.obs_hist_buf = torch.zeros(self.num_envs, self.num_obs_hist*self.num_ce_observations, device = self.device, dtype=torch.float)
+        self.selector_obs_buf = torch.zeros(self.num_envs, self.num_selector_observations, device=self.device, dtype=torch.float)
         self.rew_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         self.reset_buf = torch.ones(self.num_envs, device=self.device, dtype=torch.long)
         self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
@@ -108,6 +112,9 @@ class BaseTask():
     def get_privileged_observations(self):
         return self.privileged_obs_buf
 
+    def get_selector_observations(self):
+        return self.selector_obs_buf
+
     def reset_idx(self, env_ids):
         """Reset selected robots"""
         raise NotImplementedError
@@ -115,10 +122,10 @@ class BaseTask():
     def reset(self):
         """ Reset all robots"""
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
-        obs, privileged_obs, _, _, _, _ = self.step(torch.zeros(self.num_envs, self.num_actions, device=self.device, requires_grad=False))
-        obs_hist = torch.zeros(self.num_envs, self.num_obs_hist*self.num_observations, device = self.device, dtype=torch.float)
-        prev_privileged_obs = torch.zeros(self.num_envs, self.num_privileged_obs, device=self.device, dtype=torch.float)
-        return obs, privileged_obs, prev_privileged_obs, obs_hist
+        if self.mode == "gait":
+            self.step(torch.zeros(self.num_envs, self.num_actions, device=self.device, requires_grad=False))
+        elif self.mode == "selector":
+            self.step((torch.zeros(self.num_envs, 1, device=self.device, requires_grad=False), torch.zeros(self.num_envs, self.cfg.phase_gen.selector_phase_cmd_len, device=self.device, requires_grad=False)))
 
     def step(self, actions):
         raise NotImplementedError

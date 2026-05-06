@@ -32,7 +32,7 @@ import torch
 import numpy as np
 
 
-class RolloutBuffer:
+class SingleGaitRolloutBuffer:
     class Transition:
         def __init__(self):
             self.observations = None
@@ -51,7 +51,7 @@ class RolloutBuffer:
         def clear(self):
             self.__init__()
 
-    def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, obs_history_shape, actions_shape, device='cpu'):
+    def __init__(self, num_envs, num_transitions_per_env, obs_shape, ce_obs_shape, privileged_obs_shape, obs_history_shape, actions_shape, device='cpu'):
 
         self.device = device
 
@@ -62,7 +62,7 @@ class RolloutBuffer:
 
         # Core
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
-        self.next_observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
+        self.next_observations = torch.zeros(num_transitions_per_env, num_envs, *ce_obs_shape, device=self.device)
         self.privileged_observations = torch.zeros(num_transitions_per_env, num_envs, *privileged_obs_shape, device=self.device)
         self.observation_histories = torch.zeros(num_transitions_per_env, num_envs, *obs_history_shape, device=self.device)
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
@@ -171,4 +171,154 @@ class RolloutBuffer:
                 dones_batch = dones[batch_idx]
                 yield obs_batch, privileged_obs_batch, obs_history_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, \
                        old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, base_vel_batch, dones_batch, next_obs_batch
-    
+
+
+class GaitSelectorRolloutBuffer:
+    class Transition:
+        def __init__(self):
+            self.observations = None
+            self.privileged_observations = None
+
+            self.gait_ids = None
+            self.phase_cmds = None
+
+            self.rewards = None
+            self.dones = None
+            self.values = None
+            self.actions_log_prob = None
+
+            self.phase_cmd_mean = None
+            self.phase_cmd_sigma = None
+            self.gait_probs = None
+
+
+        def clear(self):
+            self.__init__()
+
+    def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, phase_cmd_shape, gait_num, device='cpu'):
+        self.device = device
+
+        self.obs_shape = obs_shape
+        self.privileged_obs_shape = privileged_obs_shape
+        self.phase_cmd_shape = phase_cmd_shape
+
+        # Core
+        self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
+        self.privileged_observations = torch.zeros(num_transitions_per_env, num_envs, *privileged_obs_shape, device=self.device)
+        self.gait_ids = torch.zeros(num_transitions_per_env, num_envs, 1, dtype=torch.long, device=self.device)
+        self.phase_cmds = torch.zeros(num_transitions_per_env, num_envs, *phase_cmd_shape, device=self.device)
+        self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+
+        # For PPO
+        self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.phase_cmd_mean = torch.zeros(num_transitions_per_env, num_envs, *phase_cmd_shape, device=self.device)
+        self.phase_cmd_sigma = torch.zeros(num_transitions_per_env, num_envs, *phase_cmd_shape, device=self.device)
+        self.gait_probs = torch.zeros(num_transitions_per_env, num_envs, gait_num, device=self.device)
+
+        self.num_transitions_per_env = num_transitions_per_env
+        self.num_envs = num_envs
+
+        self.step = 0
+
+    def add_transitions(self, transition: Transition):
+        if self.step >= self.num_transitions_per_env:
+            raise AssertionError("Rollout buffer overflow")
+
+        self.observations[self.step].copy_(transition.observations)
+        self.privileged_observations[self.step].copy_(transition.privileged_observations)
+
+        self.gait_ids[self.step].copy_(transition.gait_ids.view(-1, 1))
+        self.phase_cmds[self.step].copy_(transition.phase_cmds)
+
+        self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        self.values[self.step].copy_(transition.values)
+        self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
+
+        self.phase_cmd_mean[self.step].copy_(transition.phase_cmd_mean)
+        self.phase_cmd_sigma[self.step].copy_(transition.phase_cmd_sigma)
+        self.gait_probs[self.step].copy_(transition.gait_probs)
+
+        self.step += 1
+
+    def clear(self):
+        self.step = 0
+
+    def compute_returns(self, last_values, gamma, lam):
+        advantage = 0
+
+        for step in reversed(range(self.num_transitions_per_env)):
+            if step == self.num_transitions_per_env - 1:
+                next_values = last_values
+            else:
+                next_values = self.values[step + 1]
+            next_is_not_terminal = 1.0 - self.dones[step].float()
+            delta = self.rewards[step] + next_is_not_terminal * gamma * next_values - self.values[step]
+            advantage = delta + next_is_not_terminal * gamma * lam * advantage
+            self.returns[step] = advantage + self.values[step]
+
+        self.advantages = self.returns - self.values
+        self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+
+    def get_statistics(self):
+        done = self.dones.clone()
+        done[-1] = 1
+        flat_dones = done.permute(1, 0, 2).reshape(-1, 1)
+        done_indices = torch.cat((
+            flat_dones.new_tensor([-1], dtype=torch.int64),
+            flat_dones.nonzero(as_tuple=False)[:, 0]
+        ))
+        trajectory_lengths = done_indices[1:] - done_indices[:-1]
+        return trajectory_lengths.float().mean(), self.rewards.mean()
+
+    def mini_batch_generator(self, num_mini_batches, num_epochs=8):
+        batch_size = self.num_envs * self.num_transitions_per_env
+        mini_batch_size = batch_size // num_mini_batches
+
+        observations = self.observations.flatten(0, 1)
+        privileged_observations = self.privileged_observations.flatten(0, 1)
+
+        gait_ids = self.gait_ids.flatten(0, 1).squeeze(-1)
+        phase_cmds = self.phase_cmds.flatten(0, 1)
+
+        values = self.values.flatten(0, 1)
+        returns = self.returns.flatten(0, 1)
+        advantages = self.advantages.flatten(0, 1)
+        old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
+
+        old_phase_cmd_mean = self.phase_cmd_mean.flatten(0, 1)
+        old_phase_cmd_sigma = self.phase_cmd_sigma.flatten(0, 1)
+        old_gait_probs = self.gait_probs.flatten(0, 1)
+
+        dones = self.dones.flatten(0, 1)
+
+        for epoch in range(num_epochs):
+            indices = torch.randperm(
+                num_mini_batches * mini_batch_size,
+                requires_grad=False,
+                device=self.device,
+            )
+
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                end = (i + 1) * mini_batch_size
+                batch_idx = indices[start:end]
+
+                yield (
+                    observations[batch_idx],
+                    privileged_observations[batch_idx],
+                    gait_ids[batch_idx],
+                    phase_cmds[batch_idx],
+                    values[batch_idx],
+                    advantages[batch_idx],
+                    returns[batch_idx],
+                    old_actions_log_prob[batch_idx],
+                    old_phase_cmd_mean[batch_idx],
+                    old_phase_cmd_sigma[batch_idx],
+                    old_gait_probs[batch_idx],
+                    dones[batch_idx],
+                )
